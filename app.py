@@ -1063,7 +1063,7 @@ def plain(value):
 @st.cache_resource
 def _pilot_limiter():
     # Process-local counters only. No prompts, profiles, API keys or responses.
-    return {'lock':threading.Lock(),'calls':[],'failed_logins':[]}
+    return {'lock':threading.Lock(),'calls':[],'failed_logins':[],'admin_failed_logins':[]}
 
 
 def reserve_call_slot():
@@ -1101,6 +1101,40 @@ def check_access():
         else:
             with lim['lock']:lim['failed_logins'].append(now)
             st.error('Lozinka nije ispravna.')
+    return False
+
+
+def owner_access():
+    """Keep owner-only navigation behind a separate Streamlit Secret."""
+    password=str(setting('COACH_ADMIN_PASSWORD',''))
+    if len(password)<16:
+        return False
+    tag=hashlib.sha256(password.encode('utf-8')).hexdigest()
+    if st.session_state.get('coach_admin_tag')==tag:
+        if st.sidebar.button('Zaključaj vlasnički prikaz',key='coach_admin_lock'):
+            st.session_state.pop('coach_admin_tag',None)
+            st.rerun()
+        return True
+    with st.sidebar.expander('Vlasnički pristup'):
+        with st.form('coach_admin_access',clear_on_submit=True):
+            entry=st.text_input('Vlasnička lozinka',type='password')
+            attempt=st.form_submit_button('Otključaj vlasnički prikaz')
+        if attempt:
+            limiter=_pilot_limiter()
+            now=time.monotonic()
+            with limiter['lock']:
+                attempts=limiter['admin_failed_logins']
+                attempts[:]=[t for t in attempts if now-t<300]
+                limited=len(attempts)>=5
+            if limited:
+                st.error('Previše pokušaja. Pokušajte ponovo za pet minuta.')
+            elif hmac.compare_digest(entry.encode('utf-8'),password.encode('utf-8')):
+                st.session_state['coach_admin_tag']=tag
+                st.rerun()
+            else:
+                with limiter['lock']:
+                    limiter['admin_failed_logins'].append(now)
+                st.error('Lozinka nije ispravna.')
     return False
 
 
@@ -1165,13 +1199,7 @@ def confirm_actions(result):
 def render_coach(bundle):
     st.image(base64.b64decode(COACH_LOGO_PNG), width=180)
     st.title('AI°360 Coach')
-    st.caption('Pilot | Konkretizacija \u2192 izbor metode \u2192 mali korak \u2192 provjera rezultata')
-    a,b,c=st.columns(3)
-    a.metric('Zapisa u izvorniku',bundle['source_card_count'])
-    b.metric('Kartica u pretrazi',bundle['eligible_card_count'])
-    c.metric('Domena',len(bundle['domains']))
-    conversation_tab,library_tab,help_tab=st.tabs(['Razgovor','Baza metoda','Uputstvo i privatnost'])
-    with conversation_tab:
+    with st.container():
         mode=st.radio('Na\u010din rada',['Lokalni pregled','AI razgovor'],horizontal=True,key='v6_mode')
         live=mode=='AI razgovor'
         has_key=bool(setting('OPENAI_API_KEY',''))
@@ -1258,40 +1286,44 @@ def render_coach(bundle):
             st.caption('Poku\u0161aji API poziva u sesiji: '+str(st.session_state.get('v6_call_count',0))+'/'+str(MAX_CALLS_SESSION)+'. Limit nije zamjena za bud\u017eet i kontrolu pristupa na API platformi.')
             if st.session_state.get('v6_usage'):
                 st.caption('Tokeni posljednjeg uspje\u0161nog poziva: '+str(st.session_state['v6_usage'].get('total_tokens',0)))
-    with library_tab:
-        st.subheader('Radna biblioteka metoda')
-        st.warning('V7.1 ima 267 jedinstvenih radnih kartica (164 ranije + 103 nove, uklju\u010duju\u0107i NLP Practitioner I\u2013VI); 16 duplikata ranije je isklju\u010deno. To nisu 267 nau\u010dno validiranih intervencija. Oznake dokaza i autorstvo zahtijevaju uredni\u010dku provjeru.')
-        query=st.text_input('Pretra\u017ei problem ili naziv metode',key='v6_library_query')
-        domain=st.selectbox('Domen',['Svi']+list(DOMAINS),key='v6_library_domain')
-        candidates=[c for c in bundle['cards'] if c['eligible'] and (domain=='Svi' or c['DOMAIN']==domain)]
-        if query:
-            ranked={r['card']['ID'] for r in retrieve(query,bundle,limit=len(bundle['cards']))}
-            candidates=[c for c in candidates if c['ID'] in ranked or normalize(query) in normalize(c['CARD_NAME'])]
-        st.caption('Prikazano: '+str(len(candidates))+' kartica.')
-        names=[c['ID']+' | '+c['CARD_NAME'] for c in candidates]
-        if candidates:
-            index=st.selectbox('Kartica',list(range(len(candidates))),format_func=lambda x:names[x],key='v6_card')
-            c=candidates[index]
-            for title,key in [('Problem','PROBLEM'),('Pitanje za razja\u0161njenje','DIAGNOSTIC_QUESTION'),
-                              ('Prakti\u010dni postupak','STEPS'),('Mjerilo','MEASURE'),('Ograni\u010denja','LIMITATIONS')]:
-                st.markdown('**'+title+'**');plain(c[key])
-            st.caption('Autor/okvir iz baze: '+c['AUTHOR_SOURCE']+' | Radna oznaka: '+c['EVIDENCE'])
-            st.caption('Porijeklo: '+bundle['source_file']+', red '+str(c['source_row'])+'.')
-        with st.expander('Uredni\u010dki audit i izvori navedeni u Excelu'):
-            st.json(bundle['audit'])
-            st.write('Izvori ispod su katalo\u0161ki metapodaci iz Excela. Nisu dokaz da je provjerena svaka tvrdnja u svakoj kartici.')
-            for source in bundle['source_catalog']:
-                plain(str(source.get('TOPIC',''))+' | '+str(source.get('SOURCE','')))
-                st.caption(str(source.get('URL','')))
-    with help_tab:
-        st.subheader('Od simulatora do AI razgovora')
-        st.write('Lokalni pregled radi odmah. AI razgovor radi tek nakon serverske aktivacije, provjere pristupa i Va\u0161e saglasnosti za slanje. Puna provjera API-ja mora se uraditi sa vlasnikovim projektom i klju\u010dem.')
-        st.markdown('**Privatnost**')
-        st.write('Poruke su u memoriji aktivne Streamlit sesije na serveru, ne samo u Va\u0161em telefonu. Aplikacija ih ne zapisuje u GitHub ni u sopstvenu bazu. U AI re\u017eimu odabrani sadr\u017eaj se \u0161alje OpenAI API-ju. store=False ne predstavlja obe\u0107anje nultog zadr\u017eavanja kod pru\u017eaoca. Izvoz razgovora ostaje datoteka koju Vi \u010duvate.')
-        st.write('Sesija nije trajno pam\u0107enje: osvje\u017eavanje, restart ili gubitak veze mogu izbrisati unose. Prije zamjene aplikacije sa\u010duvajte podatke. Ovaj pilot nema vi\u0161ekorisni\u010dku bazu, automatsko u\u010denje niti autonomne radnje.')
-        st.markdown('**Granice**')
-        st.write('Bez trgovanja, automatskog zapo\u0161ljavanja/otpu\u0161tanja, klini\u010dke dijagnostike, web provjere cijena i zakona ili pozadinskih podsjetnika. Finansijski kalkulatori iz V5 su sa\u010duvani, ali nisu ovom nadogradnjom potvr\u0111eni kao model investicionih preporuka.')
-        st.write('Za javni proizvod potrebni su prijava po korisniku, trajna baza sa kontrolom pristupa, politika zadr\u017eavanja, nezavisna provjera metode i evaluacija na novim slu\u010dajevima. Pristupna lozinka i privremeni limiti ovdje slu\u017ee samo za ograni\u010deni pilot.')
+
+
+def render_library(bundle):
+    st.subheader('Radna biblioteka metoda')
+    st.warning('V7.1 ima 267 jedinstvenih radnih kartica (164 ranije + 103 nove, uklju\u010duju\u0107i NLP Practitioner I\u2013VI); 16 duplikata ranije je isklju\u010deno. To nisu 267 nau\u010dno validiranih intervencija. Oznake dokaza i autorstvo zahtijevaju uredni\u010dku provjeru.')
+    query=st.text_input('Pretra\u017ei problem ili naziv metode',key='v6_library_query')
+    domain=st.selectbox('Domen',['Svi']+list(DOMAINS),key='v6_library_domain')
+    candidates=[c for c in bundle['cards'] if c['eligible'] and (domain=='Svi' or c['DOMAIN']==domain)]
+    if query:
+        ranked={r['card']['ID'] for r in retrieve(query,bundle,limit=len(bundle['cards']))}
+        candidates=[c for c in candidates if c['ID'] in ranked or normalize(query) in normalize(c['CARD_NAME'])]
+    st.caption('Prikazano: '+str(len(candidates))+' kartica.')
+    names=[c['ID']+' | '+c['CARD_NAME'] for c in candidates]
+    if candidates:
+        index=st.selectbox('Kartica',list(range(len(candidates))),format_func=lambda x:names[x],key='v6_card')
+        c=candidates[index]
+        for title,key in [('Problem','PROBLEM'),('Pitanje za razja\u0161njenje','DIAGNOSTIC_QUESTION'),
+                          ('Prakti\u010dni postupak','STEPS'),('Mjerilo','MEASURE'),('Ograni\u010denja','LIMITATIONS')]:
+            st.markdown('**'+title+'**');plain(c[key])
+        st.caption('Autor/okvir iz baze: '+c['AUTHOR_SOURCE']+' | Radna oznaka: '+c['EVIDENCE'])
+        st.caption('Porijeklo: '+bundle['source_file']+', red '+str(c['source_row'])+'.')
+    with st.expander('Uredni\u010dki audit i izvori navedeni u Excelu'):
+        st.json(bundle['audit'])
+        st.write('Izvori ispod su katalo\u0161ki metapodaci iz Excela. Nisu dokaz da je provjerena svaka tvrdnja u svakoj kartici.')
+        for source in bundle['source_catalog']:
+            plain(str(source.get('TOPIC',''))+' | '+str(source.get('SOURCE','')))
+            st.caption(str(source.get('URL','')))
+
+
+def render_help():
+    st.subheader('Od simulatora do AI razgovora')
+    st.write('Lokalni pregled radi odmah. AI razgovor radi tek nakon serverske aktivacije, provjere pristupa i Va\u0161e saglasnosti za slanje. Puna provjera API-ja mora se uraditi sa vlasnikovim projektom i klju\u010dem.')
+    st.markdown('**Privatnost**')
+    st.write('Poruke su u memoriji aktivne Streamlit sesije na serveru, ne samo u Va\u0161em telefonu. Aplikacija ih ne zapisuje u GitHub ni u sopstvenu bazu. U AI re\u017eimu odabrani sadr\u017eaj se \u0161alje OpenAI API-ju. store=False ne predstavlja obe\u0107anje nultog zadr\u017eavanja kod pru\u017eaoca. Izvoz razgovora ostaje datoteka koju Vi \u010duvate.')
+    st.write('Sesija nije trajno pam\u0107enje: osvje\u017eavanje, restart ili gubitak veze mogu izbrisati unose. Prije zamjene aplikacije sa\u010duvajte podatke. Ovaj pilot nema vi\u0161ekorisni\u010dku bazu, automatsko u\u010denje niti autonomne radnje.')
+    st.markdown('**Granice**')
+    st.write('Bez trgovanja, automatskog zapo\u0161ljavanja/otpu\u0161tanja, klini\u010dke dijagnostike, web provjere cijena i zakona ili pozadinskih podsjetnika. Finansijski kalkulatori iz V5 su sa\u010duvani, ali nisu ovom nadogradnjom potvr\u0111eni kao model investicionih preporuka.')
+    st.write('Za javni proizvod potrebni su prijava po korisniku, trajna baza sa kontrolom pristupa, politika zadr\u017eavanja, nezavisna provjera metode i evaluacija na novim slu\u010dajevima. Pristupna lozinka i privremeni limiti ovdje slu\u017ee samo za ograni\u010deni pilot.')
 
 
 def _p360_number(name, container, *args, **kwargs):
@@ -1304,23 +1336,30 @@ def _p360_number(name, container, *args, **kwargs):
     return value
 
 
-st.set_page_config(page_title="AI°360 Coach | PERSONAL 360", page_icon="🧭", layout="wide")
-st.sidebar.title("PERSONAL 360")
-section=st.sidebar.radio("Otvori modul",["AI Coach V7.1","PERSONAL 360 - postojeci moduli"],key="v6_root_navigation")
-st.sidebar.caption("V7.1 pilot | Nema automatskih transakcija ni trajne baze.")
-with st.sidebar.expander("Sacuvaj unose prije izlaska"):
-    include_finance=st.checkbox("Ukljuci moje finansijske unose u lokalnu kopiju",False,key="v6_backup_finance")
-    copy_data={"schema_version":1,"version":VERSION,
-      "personal_values":st.session_state.get("personal_values",[]),
-      "personal_goals":st.session_state.get("personal_goals",[]),
-      "eisenhower_tasks":st.session_state.get("eisenhower_tasks",[])}
-    if include_finance: copy_data["financial_inputs"]=st.session_state.get("v6_legacy_inputs",{})
-    st.download_button("Preuzmi kopiju unosa (JSON)",json.dumps(copy_data,ensure_ascii=False,indent=2).encode("utf-8"),
-      "Personal360_moji_unosi.json","application/json",key="v6_backup")
-    st.caption("Kopija se cuva na Vasem uredjaju. Automatski uvoz i trajna baza nisu dio ovog pilota.")
-if section=="AI Coach V7.1":
+st.set_page_config(page_title="AI°360 Coach", page_icon="🧭", layout="wide")
+st.sidebar.title("AI°360 Coach")
+admin=owner_access()
+section=(st.sidebar.radio('Vlasnički prikaz',
+          ['AI Coach','Baza metoda','Uputstvo i privatnost','PERSONAL 360 – postojeći moduli'],
+          key='coach_owner_section') if admin else 'AI Coach')
+if section=='AI Coach':
     render_coach(load_knowledge())
     st.stop()
+if section=='Baza metoda':
+    render_library(load_knowledge())
+    st.stop()
+if section=='Uputstvo i privatnost':
+    render_help()
+    st.stop()
+with st.sidebar.expander('Sačuvaj unose prije izlaska'):
+    include_finance=st.checkbox('Uključi moje finansijske unose u lokalnu kopiju',False,key='v6_backup_finance')
+    copy_data={'schema_version':1,'version':VERSION,
+      'personal_values':st.session_state.get('personal_values',[]),
+      'personal_goals':st.session_state.get('personal_goals',[]),
+      'eisenhower_tasks':st.session_state.get('eisenhower_tasks',[])}
+    if include_finance: copy_data['financial_inputs']=st.session_state.get('v6_legacy_inputs',{})
+    st.download_button('Preuzmi kopiju unosa (JSON)',json.dumps(copy_data,ensure_ascii=False,indent=2).encode('utf-8'),
+      'Personal360_moji_unosi.json','application/json',key='v6_backup')
 st.info("Finansijski modeli su preneseni iz V5 bez nove ekonometrijske ili investicione validacije. "
         "Njihove procentualne alokacije i indeksi su radni scenariji, ne nalog za trgovanje. "
         "AI Coach radi odvojeno i ne preuzima finansijske unose automatski.")
